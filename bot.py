@@ -1,5 +1,6 @@
 import os
 import asyncio
+import hashlib
 import aiohttp
 
 from aiogram import Bot, Dispatcher, F
@@ -16,7 +17,10 @@ from aiogram.types import (
 # НАСТРОЙКИ
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv(
+    "BOT_TOKEN",
+    ""
+).strip()
 
 PUBLIC_URL = os.getenv(
     "PUBLIC_URL",
@@ -25,14 +29,19 @@ PUBLIC_URL = os.getenv(
 
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не задан")
+    raise RuntimeError(
+        "BOT_TOKEN не задан"
+    )
 
 
 # ============================================================
-# BOT / DISPATCHER
+# BOT
 # ============================================================
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(
+    token=BOT_TOKEN
+)
+
 dp = Dispatcher()
 
 
@@ -41,19 +50,27 @@ dp = Dispatcher()
 # ============================================================
 
 async def api_get(path: str):
+
     url = f"{PUBLIC_URL}{path}"
 
     try:
-        timeout = aiohttp.ClientTimeout(total=15)
+        timeout = aiohttp.ClientTimeout(
+            total=15
+        )
 
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as response:
+        async with aiohttp.ClientSession(
+            timeout=timeout
+        ) as session:
+
+            async with session.get(
+                url
+            ) as response:
 
                 text = await response.text()
 
                 if response.status != 200:
                     print(
-                        f"API GET ERROR {response.status}: "
+                        f"GET {response.status}: "
                         f"{url} -> {text}"
                     )
                     return None
@@ -62,60 +79,98 @@ async def api_get(path: str):
                     return await response.json()
                 except Exception:
                     print(
-                        f"API GET INVALID JSON: {url} -> {text}"
+                        f"INVALID JSON: "
+                        f"{url} -> {text}"
                     )
                     return None
 
     except Exception as e:
-        print(f"API GET EXCEPTION: {url} -> {e}")
+        print(
+            f"GET EXCEPTION: {url}: {e}"
+        )
         return None
 
 
-async def api_post(path: str, data: dict):
+async def api_post(
+    path: str,
+    data: dict,
+):
+
     url = f"{PUBLIC_URL}{path}"
 
     try:
-        timeout = aiohttp.ClientTimeout(total=15)
+        timeout = aiohttp.ClientTimeout(
+            total=15
+        )
 
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=data) as response:
+        async with aiohttp.ClientSession(
+            timeout=timeout
+        ) as session:
+
+            async with session.post(
+                url,
+                json=data,
+            ) as response:
 
                 text = await response.text()
 
-                if response.status not in (200, 201):
+                if response.status not in (
+                    200,
+                    201,
+                ):
                     print(
-                        f"API POST ERROR {response.status}: "
+                        f"POST {response.status}: "
                         f"{url} -> {text}"
                     )
-                    return None
+
+                    try:
+                        return {
+                            "_error": await response.json()
+                        }
+                    except Exception:
+                        return None
 
                 try:
                     return await response.json()
                 except Exception:
                     print(
-                        f"API POST INVALID JSON: {url} -> {text}"
+                        f"INVALID JSON: "
+                        f"{url} -> {text}"
                     )
                     return None
 
     except Exception as e:
-        print(f"API POST EXCEPTION: {url} -> {e}")
+        print(
+            f"POST EXCEPTION: {url}: {e}"
+        )
         return None
 
 
 async def api_delete(path: str):
+
     url = f"{PUBLIC_URL}{path}"
 
     try:
-        timeout = aiohttp.ClientTimeout(total=15)
+        timeout = aiohttp.ClientTimeout(
+            total=15
+        )
 
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.delete(url) as response:
+        async with aiohttp.ClientSession(
+            timeout=timeout
+        ) as session:
+
+            async with session.delete(
+                url
+            ) as response:
 
                 text = await response.text()
 
-                if response.status not in (200, 204):
+                if response.status not in (
+                    200,
+                    204,
+                ):
                     print(
-                        f"API DELETE ERROR {response.status}: "
+                        f"DELETE {response.status}: "
                         f"{url} -> {text}"
                     )
                     return None
@@ -128,7 +183,9 @@ async def api_delete(path: str):
                     }
 
     except Exception as e:
-        print(f"API DELETE EXCEPTION: {url} -> {e}")
+        print(
+            f"DELETE EXCEPTION: {url}: {e}"
+        )
         return None
 
 
@@ -136,7 +193,10 @@ async def api_delete(path: str):
 # USER
 # ============================================================
 
-async def get_user(telegram_id: int):
+async def get_user(
+    telegram_id: int
+):
+
     result = await api_get(
         f"/api/user/{telegram_id}"
     )
@@ -149,96 +209,84 @@ async def get_user(telegram_id: int):
 
     user = result.get("user")
 
-    if user:
-        # Добавляем subscription_url из ответа API
-        if result.get("subscription_url"):
-            user["subscription_url"] = result["subscription_url"]
+    if not user:
+        return None
 
-        # Если API по какой-то причине вернул localhost,
-        # строим правильную публичную ссылку самостоятельно.
-        token = user.get("token")
+    token = user.get("token")
 
-        if token:
+    if token:
+        user["subscription_url"] = (
+            f"{PUBLIC_URL}/sub/{token}"
+        )
+
+    user["devices"] = result.get(
+        "devices",
+        []
+    )
+
+    user["device_count"] = result.get(
+        "device_count",
+        len(user["devices"])
+    )
+
+    return user
+
+
+async def create_or_get_user(
+    telegram_id: int
+):
+
+    user = await get_user(
+        telegram_id
+    )
+
+    if user and user.get("token"):
+        return user
+
+    result = await api_post(
+        "/api/user/create",
+        {
+            "telegram_id": telegram_id
+        },
+    )
+
+    if result:
+
+        user = result.get(
+            "user"
+        )
+
+        if user and user.get("token"):
+
+            token = user["token"]
+
             user["subscription_url"] = (
                 f"{PUBLIC_URL}/sub/{token}"
             )
 
-        return user
-
-    # На случай если API вернул пользователя напрямую
-    if result.get("token"):
-        token = result["token"]
-
-        result["subscription_url"] = (
-            f"{PUBLIC_URL}/sub/{token}"
-        )
-
-        return result
-
-    return None
-
-
-async def create_or_get_user(telegram_id: int):
-    # --------------------------------------------------------
-    # 1. Сначала пробуем получить существующего пользователя
-    # --------------------------------------------------------
-
-    user = await get_user(telegram_id)
-
-    if user and user.get("token"):
-        return user
-
-    # --------------------------------------------------------
-    # 2. Если пользователя нет или нет токена —
-    #    просим API создать/восстановить его
-    # --------------------------------------------------------
-
-    created = await api_post(
-        "/api/user/create",
-        {
-            "telegram_id": telegram_id
-        }
-    )
-
-    if created:
-        created_user = created.get("user")
-
-        if created_user:
-            token = created_user.get("token")
-
-            if token:
-                created_user["subscription_url"] = (
-                    f"{PUBLIC_URL}/sub/{token}"
-                )
-
-                return created_user
-
-        if created.get("token"):
-            token = created["token"]
-
-            created["subscription_url"] = (
-                f"{PUBLIC_URL}/sub/{token}"
+            user["devices"] = result.get(
+                "devices",
+                []
             )
 
-            return created
+            user["device_count"] = result.get(
+                "device_count",
+                0
+            )
 
-    # --------------------------------------------------------
-    # 3. Повторный GET
-    # --------------------------------------------------------
+            return user
 
-    user = await get_user(telegram_id)
-
-    if user and user.get("token"):
-        return user
-
-    return None
+    return await get_user(
+        telegram_id
+    )
 
 
 # ============================================================
-# КЛАВИАТУРЫ
+# KEYBOARDS
 # ============================================================
 
 def main_keyboard():
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -268,6 +316,7 @@ def main_keyboard():
 
 
 def back_keyboard():
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -280,28 +329,42 @@ def back_keyboard():
     )
 
 
-def devices_keyboard(devices):
+def devices_keyboard(
+    devices
+):
+
     buttons = []
 
     for device in devices:
-        device_id = device.get("device_id")
 
-        if not device_id:
-            continue
+        device_id = device.get(
+            "device_id"
+        )
 
         name = device.get(
             "device_name",
-            "Unknown"
+            "Unknown",
         )
 
         buttons.append(
             [
                 InlineKeyboardButton(
                     text=f"🗑 {name}",
-                    callback_data=f"delete_device:{device_id}",
+                    callback_data=(
+                        f"delete_device:{device_id}"
+                    ),
                 )
             ]
         )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="➕ Как добавить устройство",
+                callback_data="add_device_help",
+            )
+        ]
+    )
 
     buttons.append(
         [
@@ -318,52 +381,51 @@ def devices_keyboard(devices):
 
 
 # ============================================================
-# /START
+# START
 # ============================================================
 
-@dp.message(Command("start"))
-async def start_handler(message: Message):
+@dp.message(
+    Command("start")
+)
+async def start_handler(
+    message: Message
+):
 
     user = await create_or_get_user(
         message.from_user.id
     )
 
     if not user:
+
         await message.answer(
             "❌ Не удалось создать пользователя.\n\n"
-            "Попробуй ещё раз через несколько секунд."
+            "Попробуй ещё раз."
         )
-        return
 
-    token = user.get("token")
-
-    if not token:
-        await message.answer(
-            "❌ API создал пользователя, "
-            "но токен не был получен."
-        )
         return
 
     await message.answer(
         "🦅 <b>ixxy VPN LAB</b>\n\n"
-        "🧪 Это экспериментальная версия сервиса.\n\n"
-        "Здесь можно протестировать:\n"
+        "🧪 Экспериментальная версия.\n\n"
+        "Здесь тестируем:\n"
         "• VLESS-подписку\n"
-        "• несколько серверов\n"
+        "• серверы\n"
         "• лимит устройств\n"
         "• отображение трафика\n"
-        "• управление подпиской\n\n"
-        "Выбери действие ниже.",
+        "• управление устройствами\n\n"
+        "Выбери действие:",
         reply_markup=main_keyboard(),
         parse_mode="HTML",
     )
 
 
 # ============================================================
-# ПОДПИСКА
+# SUBSCRIPTION
 # ============================================================
 
-@dp.callback_query(F.data == "subscription")
+@dp.callback_query(
+    F.data == "subscription"
+)
 async def subscription_callback(
     callback: CallbackQuery
 ):
@@ -375,43 +437,64 @@ async def subscription_callback(
     )
 
     if not user:
+
         await callback.message.edit_text(
-            "❌ Не удалось получить данные пользователя.",
+            "❌ Не удалось получить пользователя.",
             reply_markup=back_keyboard(),
         )
+
         return
 
-    token = user.get("token")
+    token = user.get(
+        "token"
+    )
 
     if not token:
+
         await callback.message.edit_text(
-            "❌ Токен не найден.\n\n"
-            "Попробуй нажать кнопку ещё раз.",
+            "❌ Токен не найден.",
             reply_markup=back_keyboard(),
         )
+
         return
 
-    subscription_url = (
+    url = (
         f"{PUBLIC_URL}/sub/{token}"
     )
 
-    expire = user.get("expire", 0)
+    expire = user.get(
+        "expire",
+        0
+    )
+
     traffic_limit = user.get(
         "traffic_limit",
         0
     )
 
-    traffic_gb = traffic_limit / (
-        1024 ** 3
+    traffic_gb = (
+        traffic_limit
+        / (1024 ** 3)
+    )
+
+    device_limit = user.get(
+        "device_limit",
+        1
+    )
+
+    devices = user.get(
+        "devices",
+        []
     )
 
     text = (
         "🔗 <b>Твоя подписка</b>\n\n"
-        f"<code>{subscription_url}</code>\n\n"
-        f"📦 Лимит: <b>{traffic_gb:.0f} GB</b>\n"
-        f"📱 Устройств: "
-        f"<b>{user.get('device_limit', 1)}</b>\n\n"
-        "Добавь эту ссылку в Happ."
+        f"<code>{url}</code>\n\n"
+        f"📦 Лимит трафика: "
+        f"<b>{traffic_gb:.0f} GB</b>\n"
+        f"📱 Устройства: "
+        f"<b>{len(devices)}/{device_limit}</b>\n\n"
+        "Добавь ссылку в Happ."
     )
 
     await callback.message.edit_text(
@@ -422,11 +505,13 @@ async def subscription_callback(
 
 
 # ============================================================
-# /sub
+# /SUB
 # ============================================================
 
-@dp.message(Command("sub"))
-async def subscription_command(
+@dp.message(
+    Command("sub")
+)
+async def sub_command(
     message: Message
 ):
 
@@ -435,36 +520,43 @@ async def subscription_command(
     )
 
     if not user:
+
         await message.answer(
             "❌ Не удалось получить пользователя."
         )
+
         return
 
-    token = user.get("token")
+    token = user.get(
+        "token"
+    )
 
     if not token:
+
         await message.answer(
             "❌ Токен не найден."
         )
+
         return
 
-    subscription_url = (
+    url = (
         f"{PUBLIC_URL}/sub/{token}"
     )
 
     await message.answer(
-        "🔗 <b>Твоя ссылка на подписку:</b>\n\n"
-        f"<code>{subscription_url}</code>\n\n"
-        "Добавь её в Happ.",
+        "🔗 <b>Твоя подписка:</b>\n\n"
+        f"<code>{url}</code>",
         parse_mode="HTML",
     )
 
 
 # ============================================================
-# ТРАФИК
+# TRAFFIC
 # ============================================================
 
-@dp.callback_query(F.data == "traffic")
+@dp.callback_query(
+    F.data == "traffic"
+)
 async def traffic_callback(
     callback: CallbackQuery
 ):
@@ -476,19 +568,25 @@ async def traffic_callback(
     )
 
     if not user:
+
         await callback.message.edit_text(
-            "❌ Не удалось получить данные.",
+            "❌ Пользователь не найден.",
             reply_markup=back_keyboard(),
         )
+
         return
 
-    token = user.get("token")
+    token = user.get(
+        "token"
+    )
 
     if not token:
+
         await callback.message.edit_text(
             "❌ Токен не найден.",
             reply_markup=back_keyboard(),
         )
+
         return
 
     traffic = await api_get(
@@ -496,40 +594,42 @@ async def traffic_callback(
     )
 
     if not traffic:
+
         await callback.message.edit_text(
             "❌ Не удалось получить трафик.",
             reply_markup=back_keyboard(),
         )
+
         return
 
     upload = traffic.get(
         "upload_human",
-        "0 B"
+        "0 B",
     )
 
     download = traffic.get(
         "download_human",
-        "0 B"
+        "0 B",
     )
 
     used = traffic.get(
         "used_human",
-        "0 B"
+        "0 B",
     )
 
     limit = traffic.get(
         "limit_human",
-        "0 B"
+        "0 B",
     )
 
     remaining = traffic.get(
         "remaining_human",
-        "0 B"
+        "0 B",
     )
 
     percent = traffic.get(
         "percent",
-        0
+        0,
     )
 
     text = (
@@ -539,7 +639,10 @@ async def traffic_callback(
         f"📦 Использовано: <b>{used}</b>\n"
         f"📦 Лимит: <b>{limit}</b>\n"
         f"🟢 Осталось: <b>{remaining}</b>\n\n"
-        f"📈 Использовано: <b>{percent:.1f}%</b>"
+        f"📈 Использовано: "
+        f"<b>{percent:.1f}%</b>\n\n"
+        "ℹ️ Трафик пока считается "
+        "по данным LAB API."
     )
 
     await callback.message.edit_text(
@@ -550,10 +653,12 @@ async def traffic_callback(
 
 
 # ============================================================
-# УСТРОЙСТВА
+# DEVICES
 # ============================================================
 
-@dp.callback_query(F.data == "devices")
+@dp.callback_query(
+    F.data == "devices"
+)
 async def devices_callback(
     callback: CallbackQuery
 ):
@@ -565,29 +670,17 @@ async def devices_callback(
     )
 
     if not user:
+
         await callback.message.edit_text(
-            "❌ Не удалось получить данные.",
+            "❌ Пользователь не найден.",
             reply_markup=back_keyboard(),
         )
-        return
 
-    token = user.get("token")
-
-    if not token:
-        await callback.message.edit_text(
-            "❌ Токен не найден.",
-            reply_markup=back_keyboard(),
-        )
         return
 
     devices = user.get(
         "devices",
         []
-    )
-
-    device_count = user.get(
-        "device_count",
-        len(devices)
     )
 
     device_limit = user.get(
@@ -596,54 +689,301 @@ async def devices_callback(
     )
 
     if not devices:
+
         text = (
             "📱 <b>Устройства</b>\n\n"
-            "Подключённых устройств пока нет.\n\n"
-            f"Лимит: <b>{device_limit}</b>"
+            "Пока ни одного устройства "
+            "не зарегистрировано.\n\n"
+            f"Лимит: <b>0/{device_limit}</b>\n\n"
+            "Для теста отправь:\n"
+            "<code>/device iPhone</code>"
         )
+
     else:
+
         lines = [
             "📱 <b>Устройства</b>",
             "",
             f"Используется: "
-            f"<b>{device_count}/{device_limit}</b>",
+            f"<b>{len(devices)}/{device_limit}</b>",
             "",
         ]
 
         for index, device in enumerate(
             devices,
-            start=1
+            start=1,
         ):
+
             name = device.get(
                 "device_name",
-                "Unknown"
+                "Unknown",
             )
 
             platform = device.get(
                 "platform",
-                "Unknown"
+                "Unknown",
             )
 
             lines.append(
-                f"{index}. 📱 {name} "
-                f"({platform})"
+                f"{index}. 📱 <b>{name}</b>"
             )
 
-        text = "\n".join(lines)
+            lines.append(
+                f"   ОС: {platform}"
+            )
+
+        text = "\n".join(
+            lines
+        )
 
     await callback.message.edit_text(
         text,
-        reply_markup=devices_keyboard(devices),
+        reply_markup=devices_keyboard(
+            devices
+        ),
         parse_mode="HTML",
     )
 
 
 # ============================================================
-# УДАЛЕНИЕ УСТРОЙСТВА
+# ADD DEVICE HELP
 # ============================================================
 
 @dp.callback_query(
-    F.data.startswith("delete_device:")
+    F.data == "add_device_help"
+)
+async def add_device_help(
+    callback: CallbackQuery
+):
+
+    await callback.answer()
+
+    await callback.message.edit_text(
+        "📱 <b>Добавление устройства</b>\n\n"
+        "Для теста отправь команду:\n\n"
+        "<code>/device iPhone</code>\n\n"
+        "Например:\n"
+        "<code>/device iPhone</code>\n"
+        "<code>/device iPad</code>\n"
+        "<code>/device Android</code>\n\n"
+        "Если лимит равен 1, второе устройство "
+        "будет автоматически заблокировано.",
+        reply_markup=back_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# /DEVICE
+# ============================================================
+
+@dp.message(
+    Command("device")
+)
+async def device_command(
+    message: Message
+):
+
+    args = message.text.split(
+        maxsplit=1
+    )
+
+    if len(args) < 2:
+        await message.answer(
+            "📱 <b>Добавление устройства</b>\n\n"
+            "Используй:\n"
+            "<code>/device iPhone</code>\n\n"
+            "Примеры:\n"
+            "<code>/device iPhone</code>\n"
+            "<code>/device iPad</code>\n"
+            "<code>/device Android</code>",
+            parse_mode="HTML",
+        )
+
+        return
+
+    device_name = args[1].strip()
+
+    if len(device_name) > 40:
+        device_name = device_name[:40]
+
+    user = await create_or_get_user(
+        message.from_user.id
+    )
+
+    if not user:
+
+        await message.answer(
+            "❌ Пользователь не найден."
+        )
+
+        return
+
+    token = user.get(
+        "token"
+    )
+
+    if not token:
+
+        await message.answer(
+            "❌ Токен не найден."
+        )
+
+        return
+
+    # Создаём стабильный ID устройства
+    raw_id = (
+        f"{message.from_user.id}:"
+        f"{device_name.lower()}"
+    )
+
+    device_id = hashlib.sha256(
+        raw_id.encode(
+            "utf-8"
+        )
+    ).hexdigest()[:24]
+
+    # Определяем платформу
+    lower = device_name.lower()
+
+    if "iphone" in lower or "ipad" in lower:
+        platform = "iOS"
+
+    elif (
+        "android" in lower
+        or "samsung" in lower
+        or "xiaomi" in lower
+        or "redmi" in lower
+    ):
+        platform = "Android"
+
+    elif (
+        "windows" in lower
+        or "pc" in lower
+        or "computer" in lower
+    ):
+        platform = "Windows"
+
+    elif "mac" in lower:
+        platform = "macOS"
+
+    else:
+        platform = "Unknown"
+
+    result = await api_post(
+        "/api/device/register",
+        {
+            "token": token,
+            "device_id": device_id,
+            "device_name": device_name,
+            "platform": platform,
+        },
+    )
+
+    # --------------------------------------------------------
+    # ЛИМИТ ДОСТИГНУТ
+    # --------------------------------------------------------
+
+    if result and result.get(
+        "_error"
+    ):
+
+        error = result["_error"]
+
+        detail = error.get(
+            "detail",
+            {}
+        )
+
+        if (
+            isinstance(detail, dict)
+            and detail.get("error")
+            == "device_limit"
+        ):
+
+            limit = detail.get(
+                "device_limit",
+                user.get(
+                    "device_limit",
+                    1
+                ),
+            )
+
+            count = detail.get(
+                "device_count",
+                limit,
+            )
+
+            await message.answer(
+                "🚫 <b>Лимит устройств достигнут</b>\n\n"
+                f"📱 Используется: "
+                f"<b>{count}/{limit}</b>\n\n"
+                f"Новое устройство "
+                f"<b>{device_name}</b> "
+                "добавить нельзя.\n\n"
+                "Сначала удали одно из "
+                "существующих устройств.",
+                parse_mode="HTML",
+            )
+
+            return
+
+    if not result:
+
+        await message.answer(
+            "❌ Не удалось зарегистрировать устройство."
+        )
+
+        return
+
+    if result.get(
+        "success"
+    ):
+
+        devices = result.get(
+            "devices",
+            []
+        )
+
+        device_count = result.get(
+            "device_count",
+            len(devices)
+        )
+
+        device_limit = result.get(
+            "device_limit",
+            user.get(
+                "device_limit",
+                1
+            )
+        )
+
+        await message.answer(
+            "✅ <b>Устройство зарегистрировано</b>\n\n"
+            f"📱 Устройство: "
+            f"<b>{device_name}</b>\n"
+            f"💻 Платформа: "
+            f"<b>{platform}</b>\n\n"
+            f"📊 Лимит: "
+            f"<b>{device_count}/{device_limit}</b>",
+            parse_mode="HTML",
+        )
+
+        return
+
+    await message.answer(
+        "❌ Не удалось зарегистрировать устройство."
+    )
+
+
+# ============================================================
+# DELETE DEVICE
+# ============================================================
+
+@dp.callback_query(
+    F.data.startswith(
+        "delete_device:"
+    )
 )
 async def delete_device_callback(
     callback: CallbackQuery
@@ -661,19 +1001,25 @@ async def delete_device_callback(
     )
 
     if not user:
+
         await callback.message.edit_text(
             "❌ Пользователь не найден.",
             reply_markup=back_keyboard(),
         )
+
         return
 
-    token = user.get("token")
+    token = user.get(
+        "token"
+    )
 
     if not token:
+
         await callback.message.edit_text(
             "❌ Токен не найден.",
             reply_markup=back_keyboard(),
         )
+
         return
 
     result = await api_delete(
@@ -681,114 +1027,129 @@ async def delete_device_callback(
     )
 
     if not result:
+
         await callback.message.edit_text(
             "❌ Не удалось удалить устройство.",
             reply_markup=back_keyboard(),
         )
+
         return
 
-    # Обновляем список
     user = await get_user(
         callback.from_user.id
     )
 
-    if not user:
-        await callback.message.edit_text(
-            "✅ Устройство удалено.",
-            reply_markup=back_keyboard(),
+    devices = (
+        user.get(
+            "devices",
+            []
         )
-        return
-
-    devices = user.get(
-        "devices",
-        []
+        if user
+        else []
     )
 
-    device_count = user.get(
-        "device_count",
-        len(devices)
-    )
-
-    device_limit = user.get(
-        "device_limit",
-        1
+    device_limit = (
+        user.get(
+            "device_limit",
+            1
+        )
+        if user
+        else 1
     )
 
     if not devices:
+
         text = (
             "📱 <b>Устройства</b>\n\n"
             "Все устройства удалены.\n\n"
-            f"Лимит: <b>{device_limit}</b>"
+            f"Лимит: <b>0/{device_limit}</b>\n\n"
+            "Теперь можно добавить новое."
         )
+
     else:
+
         lines = [
             "📱 <b>Устройства</b>",
             "",
             f"Используется: "
-            f"<b>{device_count}/{device_limit}</b>",
+            f"<b>{len(devices)}/{device_limit}</b>",
             "",
         ]
 
         for index, device in enumerate(
             devices,
-            start=1
+            start=1,
         ):
+
             name = device.get(
                 "device_name",
-                "Unknown"
+                "Unknown",
             )
 
             platform = device.get(
                 "platform",
-                "Unknown"
+                "Unknown",
             )
 
             lines.append(
-                f"{index}. 📱 {name} "
-                f"({platform})"
+                f"{index}. 📱 <b>{name}</b>"
             )
 
-        text = "\n".join(lines)
+            lines.append(
+                f"   ОС: {platform}"
+            )
+
+        text = "\n".join(
+            lines
+        )
 
     await callback.message.edit_text(
         text,
-        reply_markup=devices_keyboard(devices),
+        reply_markup=devices_keyboard(
+            devices
+        ),
         parse_mode="HTML",
     )
 
 
 # ============================================================
-# СЕРВЕРЫ
+# SERVERS
 # ============================================================
 
-@dp.callback_query(F.data == "servers")
+@dp.callback_query(
+    F.data == "servers"
+)
 async def servers_callback(
     callback: CallbackQuery
 ):
 
     await callback.answer()
 
-    servers = await api_get(
+    result = await api_get(
         "/api/servers"
     )
 
-    if not servers:
+    if not result:
+
         await callback.message.edit_text(
-            "❌ Не удалось получить список серверов.",
+            "❌ Не удалось получить серверы.",
             reply_markup=back_keyboard(),
         )
+
         return
 
-    server_list = servers.get(
+    servers = result.get(
         "servers",
         []
     )
 
-    if not server_list:
+    if not servers:
+
         await callback.message.edit_text(
             "🌍 Серверов пока нет.",
             reply_markup=back_keyboard(),
         )
+
         return
 
     lines = [
@@ -796,28 +1157,39 @@ async def servers_callback(
         "",
     ]
 
-    for server in server_list:
+    for server in servers:
 
         name = server.get(
             "name",
-            "Неизвестный сервер"
+            "Unknown",
         )
 
         status = server.get(
             "status",
-            "unknown"
+            "configured",
         )
 
         if status == "online":
-            status_text = "🟢"
+            icon = "🟢"
+
         elif status == "offline":
-            status_text = "🔴"
+            icon = "🔴"
+
         else:
-            status_text = "🟡"
+            icon = "⚙️"
 
         lines.append(
-            f"{status_text} <b>{name}</b>"
+            f"{icon} {name}"
         )
+
+    lines.extend(
+        [
+            "",
+            "⚙️ Статус «configured» означает, "
+            "что сервер добавлен в подписку. "
+            "LAB пока не проверяет его доступность.",
+        ]
+    )
 
     await callback.message.edit_text(
         "\n".join(lines),
@@ -827,10 +1199,12 @@ async def servers_callback(
 
 
 # ============================================================
-# НАЗАД
+# BACK
 # ============================================================
 
-@dp.callback_query(F.data == "back")
+@dp.callback_query(
+    F.data == "back"
+)
 async def back_callback(
     callback: CallbackQuery
 ):
@@ -846,31 +1220,25 @@ async def back_callback(
 
 
 # ============================================================
-# ERROR HANDLER
-# ============================================================
-
-@dp.errors()
-async def errors_handler(event):
-    print(
-        "BOT ERROR:",
-        event.exception
-    )
-
-
-# ============================================================
-# START
+# START BOT
 # ============================================================
 
 async def main():
 
-    print("================================")
-    print("       ixxy VPN LAB BOT")
-    print("================================")
+    print(
+        "================================"
+    )
+    print(
+        "       ixxy VPN LAB BOT"
+    )
+    print(
+        "================================"
+    )
     print(
         f"PUBLIC_URL: {PUBLIC_URL}"
     )
 
-    # Важно: только один экземпляр бота
+    # Только один экземпляр бота
     await bot.delete_webhook(
         drop_pending_updates=True
     )
@@ -881,7 +1249,14 @@ async def main():
 
 
 if __name__ == "__main__":
+
     try:
-        asyncio.run(main())
+        asyncio.run(
+            main()
+        )
+
     except KeyboardInterrupt:
-        print("Bot stopped")
+
+        print(
+            "Bot stopped"
+        )
