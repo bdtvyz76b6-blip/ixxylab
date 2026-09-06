@@ -3,23 +3,20 @@ import secrets
 import sqlite3
 import time
 
-from datetime import datetime, timedelta
-from urllib.parse import unquote
-
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 
 # ============================================================
-# CONFIG
+# НАСТРОЙКИ
 # ============================================================
 
 DB_PATH = os.getenv("DB_PATH", "ixxy_lab.db")
 
 PUBLIC_URL = os.getenv(
     "PUBLIC_URL",
-    "http://localhost:8000"
+    "https://ixxylab-1.onrender.com",
 ).rstrip("/")
 
 DEFAULT_TRAFFIC_LIMIT = 50 * 1024 * 1024 * 1024  # 50 GB
@@ -28,7 +25,7 @@ DEFAULT_DAYS = 30
 
 
 # ============================================================
-# VLESS SERVERS
+# VLESS СЕРВЕРЫ
 # ============================================================
 
 VLESS_SERVERS = [
@@ -55,13 +52,12 @@ VLESS_SERVERS = [
 
 
 # ============================================================
-# APP
+# FASTAPI
 # ============================================================
 
 app = FastAPI(
     title="ixxy VPN LAB",
-    version="1.0.0",
-    description="Experimental VPN subscription API",
+    version="2.0",
 )
 
 
@@ -72,6 +68,7 @@ app = FastAPI(
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
@@ -105,8 +102,12 @@ def init_db():
             first_seen INTEGER NOT NULL,
             last_seen INTEGER NOT NULL,
             active INTEGER NOT NULL DEFAULT 1,
+
             UNIQUE(user_id, device_id),
-            FOREIGN KEY(user_id) REFERENCES users(id)
+
+            FOREIGN KEY(user_id)
+                REFERENCES users(id)
+                ON DELETE CASCADE
         )
         """
     )
@@ -115,14 +116,16 @@ def init_db():
     conn.close()
 
 
-init_db()
+@app.on_event("startup")
+def startup():
+    init_db()
 
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def now() -> int:
+def now():
     return int(time.time())
 
 
@@ -135,32 +138,32 @@ def format_bytes(value: int) -> str:
         "MB",
         "GB",
         "TB",
-        "PB",
     ]
 
     size = float(value)
 
     for unit in units:
-        if size < 1024 or unit == units[-1]:
+        if size < 1024 or unit == "TB":
             if unit == "B":
-                return f"{int(size)} {unit}"
+                return f"{int(size)} B"
 
-            if size >= 10:
-                return f"{size:.0f} {unit}"
-
-            return f"{size:.1f} {unit}"
+            return f"{size:.2f} {unit}"
 
         size /= 1024
 
-    return "0 B"
+    return f"{size:.2f} TB"
 
 
 def row_to_dict(row):
-    if row is None:
+    if not row:
         return None
 
     return dict(row)
 
+
+# ============================================================
+# USERS
+# ============================================================
 
 def get_user_by_token(token: str):
     conn = db()
@@ -176,7 +179,7 @@ def get_user_by_token(token: str):
 
     conn.close()
 
-    return row_to_dict(row)
+    return row
 
 
 def get_user_by_telegram(telegram_id: int):
@@ -193,18 +196,49 @@ def get_user_by_telegram(telegram_id: int):
 
     conn.close()
 
-    return row_to_dict(row)
+    return row
 
 
-def create_user(
-    telegram_id: int,
-    days: int = DEFAULT_DAYS,
-    traffic_limit: int = DEFAULT_TRAFFIC_LIMIT,
-    device_limit: int = DEFAULT_DEVICE_LIMIT,
-):
+def create_user(telegram_id: int):
+    existing = get_user_by_telegram(telegram_id)
+
+    if existing:
+        data = row_to_dict(existing)
+
+        # Ремонт пустого токена
+        if not data.get("token"):
+            token = secrets.token_urlsafe(32)
+
+            conn = db()
+
+            conn.execute(
+                """
+                UPDATE users
+                SET token = ?
+                WHERE telegram_id = ?
+                """,
+                (
+                    token,
+                    telegram_id,
+                ),
+            )
+
+            conn.commit()
+            conn.close()
+
+            existing = get_user_by_telegram(
+                telegram_id
+            )
+
+        return row_to_dict(existing)
+
     token = secrets.token_urlsafe(32)
-    created = now()
-    expire = created + days * 86400
+
+    current = now()
+
+    expire = current + (
+        DEFAULT_DAYS * 24 * 60 * 60
+    )
 
     conn = db()
 
@@ -226,26 +260,27 @@ def create_user(
             telegram_id,
             token,
             expire,
-            traffic_limit,
-            device_limit,
-            created,
+            DEFAULT_TRAFFIC_LIMIT,
+            DEFAULT_DEVICE_LIMIT,
+            current,
         ),
     )
 
     conn.commit()
     conn.close()
 
-    return get_user_by_telegram(telegram_id)
+    return row_to_dict(
+        get_user_by_telegram(telegram_id)
+    )
 
 
 def get_or_create_user(telegram_id: int):
-    user = get_user_by_telegram(telegram_id)
-
-    if user:
-        return user
-
     return create_user(telegram_id)
 
+
+# ============================================================
+# DEVICES
+# ============================================================
 
 def get_devices(user_id: int):
     conn = db()
@@ -262,26 +297,89 @@ def get_devices(user_id: int):
             active
         FROM devices
         WHERE user_id = ?
-        ORDER BY last_seen DESC
+          AND active = 1
+        ORDER BY first_seen ASC
         """,
         (user_id,),
     ).fetchall()
 
     conn.close()
 
-    return [dict(row) for row in rows]
+    return [
+        dict(row)
+        for row in rows
+    ]
 
 
 def register_device(
     user_id: int,
     device_id: str,
-    device_name: str = "Unknown",
-    platform: str = "Unknown",
+    device_name: str,
+    platform: str,
 ):
-    current = now()
-
     conn = db()
 
+    # Уже зарегистрировано
+    existing = conn.execute(
+        """
+        SELECT *
+        FROM devices
+        WHERE user_id = ?
+          AND device_id = ?
+        """,
+        (
+            user_id,
+            device_id,
+        ),
+    ).fetchone()
+
+    current = now()
+
+    if existing:
+        conn.execute(
+            """
+            UPDATE devices
+            SET
+                device_name = ?,
+                platform = ?,
+                last_seen = ?,
+                active = 1
+            WHERE user_id = ?
+              AND device_id = ?
+            """,
+            (
+                device_name,
+                platform,
+                current,
+                user_id,
+                device_id,
+            ),
+        )
+
+        conn.commit()
+
+        row = conn.execute(
+            """
+            SELECT *
+            FROM devices
+            WHERE user_id = ?
+              AND device_id = ?
+            """,
+            (
+                user_id,
+                device_id,
+            ),
+        ).fetchone()
+
+        conn.close()
+
+        return {
+            "success": True,
+            "already_registered": True,
+            "device": dict(row),
+        }
+
+    # Получаем лимит пользователя
     user = conn.execute(
         """
         SELECT device_limit
@@ -293,47 +391,14 @@ def register_device(
 
     if not user:
         conn.close()
-        raise HTTPException(
-            status_code=404,
-            detail="User not found",
-        )
-
-    existing = conn.execute(
-        """
-        SELECT id
-        FROM devices
-        WHERE user_id = ?
-          AND device_id = ?
-        """,
-        (user_id, device_id),
-    ).fetchone()
-
-    if existing:
-        conn.execute(
-            """
-            UPDATE devices
-            SET
-                device_name = ?,
-                platform = ?,
-                last_seen = ?,
-                active = 1
-            WHERE id = ?
-            """,
-            (
-                device_name,
-                platform,
-                current,
-                existing["id"],
-            ),
-        )
-
-        conn.commit()
-        conn.close()
-
         return {
-            "success": True,
-            "existing": True,
+            "success": False,
+            "error": "user_not_found",
         }
+
+    device_limit = int(
+        user["device_limit"]
+    )
 
     active_count = conn.execute(
         """
@@ -345,16 +410,15 @@ def register_device(
         (user_id,),
     ).fetchone()[0]
 
-    if active_count >= user["device_limit"]:
+    if active_count >= device_limit:
         conn.close()
 
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "error": "device_limit_reached",
-                "limit": user["device_limit"],
-            },
-        )
+        return {
+            "success": False,
+            "error": "device_limit",
+            "device_limit": device_limit,
+            "device_count": active_count,
+        }
 
     conn.execute(
         """
@@ -380,18 +444,55 @@ def register_device(
     )
 
     conn.commit()
+
+    row = conn.execute(
+        """
+        SELECT *
+        FROM devices
+        WHERE user_id = ?
+          AND device_id = ?
+        """,
+        (
+            user_id,
+            device_id,
+        ),
+    ).fetchone()
+
     conn.close()
 
     return {
         "success": True,
-        "existing": False,
+        "already_registered": False,
+        "device": dict(row),
     }
 
 
-def delete_device(user_id: int, device_id: str):
+def delete_device(
+    user_id: int,
+    device_id: str,
+):
     conn = db()
 
-    result = conn.execute(
+    row = conn.execute(
+        """
+        SELECT *
+        FROM devices
+        WHERE user_id = ?
+          AND device_id = ?
+          AND active = 1
+        """,
+        (
+            user_id,
+            device_id,
+        ),
+    ).fetchone()
+
+    if not row:
+        conn.close()
+
+        return False
+
+    conn.execute(
         """
         UPDATE devices
         SET active = 0
@@ -407,79 +508,65 @@ def delete_device(user_id: int, device_id: str):
     conn.commit()
     conn.close()
 
-    return result.rowcount > 0
+    return True
 
 
-def get_traffic(user_id: int):
-    conn = db()
+# ============================================================
+# TRAFFIC
+# ============================================================
 
-    row = conn.execute(
-        """
-        SELECT
-            upload,
-            download,
-            traffic_limit
-        FROM users
-        WHERE id = ?
-        """,
-        (user_id,),
-    ).fetchone()
+def get_traffic(user):
+    upload = int(user["upload"])
+    download = int(user["download"])
+    limit = int(user["traffic_limit"])
 
-    conn.close()
+    used = upload + download
 
-    if not row:
-        return None
-
-    upload = int(row["upload"])
-    download = int(row["download"])
-    total = upload + download
-    limit = int(row["traffic_limit"])
-
-    remaining = max(0, limit - total)
+    remaining = max(
+        0,
+        limit - used
+    )
 
     if limit > 0:
-        percent = min(
-            100,
-            round(total / limit * 100, 2),
-        )
+        percent = (
+            used / limit
+        ) * 100
     else:
         percent = 0
 
     return {
         "upload": upload,
         "download": download,
-        "used": total,
+        "used": used,
         "limit": limit,
         "remaining": remaining,
-        "percent": percent,
+        "percent": round(percent, 2),
+
         "upload_human": format_bytes(upload),
         "download_human": format_bytes(download),
-        "used_human": format_bytes(total),
+        "used_human": format_bytes(used),
         "limit_human": format_bytes(limit),
-        "remaining_human": format_bytes(remaining),
+        "remaining_human": format_bytes(
+            remaining
+        ),
     }
 
 
 # ============================================================
-# HAPP SUBSCRIPTION HEADERS
+# HAPP HEADERS
 # ============================================================
 
 def subscription_header(user):
-    upload = int(user["upload"])
-    download = int(user["download"])
-    total = int(user["traffic_limit"])
-    expire = int(user["expire"])
-
     return (
-        f"upload={upload}; "
-        f"download={download}; "
-        f"total={total}; "
-        f"expire={expire}"
+        f"upload={user['upload']};"
+        f" download={user['download']};"
+        f" total={user['traffic_limit']};"
+        f" expire={user['expire']}"
     )
 
 
 # ============================================================
-# MODELS
+# PYDANTIC MODELS
 # ============================================================
 
 class CreateUserRequest(BaseModel):
@@ -500,22 +587,18 @@ class RegisterDeviceRequest(BaseModel):
 @app.get("/")
 def root():
     return {
+        "success": True,
         "service": "ixxy VPN LAB",
-        "status": "online",
-        "version": "1.0.0",
-        "servers": len(VLESS_SERVERS),
+        "version": "2.0",
+        "status": "running",
     }
 
-
-# ============================================================
-# HEALTH
-# ============================================================
 
 @app.get("/health")
 def health():
     return {
+        "success": True,
         "status": "ok",
-        "service": "ixxy VPN LAB",
         "time": now(),
     }
 
@@ -525,25 +608,48 @@ def health():
 # ============================================================
 
 @app.post("/api/user/create")
-def api_create_user(data: CreateUserRequest):
-    user = get_or_create_user(data.telegram_id)
+def api_create_user(
+    request: CreateUserRequest
+):
+    user = get_or_create_user(
+        request.telegram_id
+    )
+
+    if not user:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to create user",
+        )
+
+    token = user["token"]
 
     return {
         "success": True,
         "user": user,
         "subscription_url": (
-            f"{PUBLIC_URL}/sub/{user['token']}"
+            f"{PUBLIC_URL}/sub/{token}"
+        ),
+        "traffic": get_traffic(user),
+        "devices": get_devices(
+            user["id"]
+        ),
+        "device_count": len(
+            get_devices(user["id"])
         ),
     }
 
 
 # ============================================================
-# USER BY TELEGRAM ID
+# GET USER
 # ============================================================
 
 @app.get("/api/user/{telegram_id}")
-def api_get_user(telegram_id: int):
-    user = get_user_by_telegram(telegram_id)
+def api_get_user(
+    telegram_id: int
+):
+    user = get_user_by_telegram(
+        telegram_id
+    )
 
     if not user:
         raise HTTPException(
@@ -551,25 +657,28 @@ def api_get_user(telegram_id: int):
             detail="User not found",
         )
 
-    traffic = get_traffic(user["id"])
-    devices = get_devices(user["id"])
+    user = row_to_dict(user)
+
+    token = user["token"]
+
+    devices = get_devices(
+        user["id"]
+    )
 
     return {
         "success": True,
         "user": user,
         "subscription_url": (
-            f"{PUBLIC_URL}/sub/{user['token']}"
+            f"{PUBLIC_URL}/sub/{token}"
         ),
-        "traffic": traffic,
+        "traffic": get_traffic(user),
         "devices": devices,
-        "device_count": len(
-            [d for d in devices if d["active"]]
-        ),
+        "device_count": len(devices),
     }
 
 
 # ============================================================
-# USER BY TOKEN
+# GET USER BY TOKEN
 # ============================================================
 
 @app.get("/api/token/{token}")
@@ -579,20 +688,21 @@ def api_get_token(token: str):
     if not user:
         raise HTTPException(
             status_code=404,
-            detail="Invalid token",
+            detail="Token not found",
         )
 
-    traffic = get_traffic(user["id"])
-    devices = get_devices(user["id"])
+    user = row_to_dict(user)
+
+    devices = get_devices(
+        user["id"]
+    )
 
     return {
         "success": True,
         "user": user,
-        "subscription_url": (
-            f"{PUBLIC_URL}/sub/{user['token']}"
-        ),
-        "traffic": traffic,
+        "traffic": get_traffic(user),
         "devices": devices,
+        "device_count": len(devices),
     }
 
 
@@ -601,8 +711,12 @@ def api_get_token(token: str):
 # ============================================================
 
 @app.post("/api/device/register")
-def api_register_device(data: RegisterDeviceRequest):
-    user = get_user_by_token(data.token)
+def api_register_device(
+    request: RegisterDeviceRequest
+):
+    user = get_user_by_token(
+        request.token
+    )
 
     if not user:
         raise HTTPException(
@@ -610,23 +724,50 @@ def api_register_device(data: RegisterDeviceRequest):
             detail="Invalid token",
         )
 
-    if int(user["expire"]) <= now():
-        raise HTTPException(
-            status_code=403,
-            detail="Subscription expired",
-        )
-
     result = register_device(
         user_id=user["id"],
-        device_id=data.device_id,
-        device_name=data.device_name,
-        platform=data.platform,
+        device_id=request.device_id.strip(),
+        device_name=request.device_name.strip(),
+        platform=request.platform.strip(),
+    )
+
+    if not result["success"]:
+
+        if result.get("error") == "device_limit":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "device_limit",
+                    "message": "Device limit reached",
+                    "device_limit": result[
+                        "device_limit"
+                    ],
+                    "device_count": result[
+                        "device_count"
+                    ],
+                },
+            )
+
+        raise HTTPException(
+            status_code=400,
+            detail=result,
+        )
+
+    devices = get_devices(
+        user["id"]
     )
 
     return {
         "success": True,
-        "device": result,
-        "devices": get_devices(user["id"]),
+        "message": (
+            "Device registered"
+        ),
+        "device": result["device"],
+        "devices": devices,
+        "device_count": len(devices),
+        "device_limit": user[
+            "device_limit"
+        ],
     }
 
 
@@ -634,7 +775,9 @@ def api_register_device(data: RegisterDeviceRequest):
 # DELETE DEVICE
 # ============================================================
 
-@app.delete("/api/device/{token}/{device_id}")
+@app.delete(
+    "/api/device/{token}/{device_id}"
+)
 def api_delete_device(
     token: str,
     device_id: str,
@@ -648,8 +791,8 @@ def api_delete_device(
         )
 
     deleted = delete_device(
-        user_id=user["id"],
-        device_id=unquote(device_id),
+        user["id"],
+        device_id,
     )
 
     if not deleted:
@@ -658,9 +801,18 @@ def api_delete_device(
             detail="Device not found",
         )
 
+    devices = get_devices(
+        user["id"]
+    )
+
     return {
         "success": True,
-        "devices": get_devices(user["id"]),
+        "message": "Device deleted",
+        "devices": devices,
+        "device_count": len(devices),
+        "device_limit": user[
+            "device_limit"
+        ],
     }
 
 
@@ -678,12 +830,7 @@ def api_traffic(token: str):
             detail="Invalid token",
         )
 
-    traffic = get_traffic(user["id"])
-
-    return {
-        "success": True,
-        "traffic": traffic,
-    }
+    return get_traffic(user)
 
 
 # ============================================================
@@ -692,34 +839,36 @@ def api_traffic(token: str):
 
 @app.get("/api/servers")
 def api_servers():
-    servers = []
+    result = []
 
-    for index, link in enumerate(VLESS_SERVERS, start=1):
-        name = f"Server {index}"
+    for index, link in enumerate(
+        VLESS_SERVERS,
+        start=1
+    ):
+        name = (
+            link.split("#", 1)[1]
+            if "#" in link
+            else f"Server {index}"
+        )
 
-        if "#" in link:
-            name = unquote(
-                link.split("#", 1)[1]
-            )
-
-        servers.append(
+        result.append(
             {
                 "id": index,
                 "name": name,
+                "status": "configured",
                 "link": link,
-                "status": "online",
             }
         )
 
     return {
         "success": True,
-        "count": len(servers),
-        "servers": servers,
+        "count": len(result),
+        "servers": result,
     }
 
 
 # ============================================================
-# HAPP SUBSCRIPTION
+# SUBSCRIPTION
 # ============================================================
 
 @app.get(
@@ -727,6 +876,7 @@ def api_servers():
     response_class=PlainTextResponse,
 )
 def subscription(token: str):
+
     user = get_user_by_token(token)
 
     if not user:
@@ -741,7 +891,8 @@ def subscription(token: str):
     # EXPIRED
     # --------------------------------------------------------
 
-    if int(user["expire"]) <= current:
+    if current >= user["expire"]:
+
         expired_link = (
             "vless://00000000-0000-0000-0000-000000000000"
             "@expired.invalid:443"
@@ -752,86 +903,61 @@ def subscription(token: str):
             "&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
             "&sid="
             "&flow=xtls-rprx-vision"
-            "#VPN подписка истекла 🔴"
+            "#Подписка неактивна"
         )
-
-        headers = {
-            "subscription-userinfo": (
-                "upload=0; "
-                "download=0; "
-                "total=0; "
-                f"expire={user['expire']}"
-            ),
-            "profile-title": "ixxy VPN LAB",
-            "profile-update-interval": "60",
-            "cache-control": "no-cache",
-        }
 
         return PlainTextResponse(
             content=expired_link,
-            headers=headers,
-            media_type="text/plain; charset=utf-8",
+            headers={
+                "subscription-userinfo": (
+                    "upload=0; "
+                    "download=0; "
+                    f"total={user['traffic_limit']}; "
+                    f"expire={user['expire']}"
+                ),
+                "profile-title": "ixxy VPN LAB",
+                "profile-update-interval": "60",
+                "cache-control": "no-cache",
+            },
         )
 
     # --------------------------------------------------------
     # ACTIVE
     # --------------------------------------------------------
 
-    if not VLESS_SERVERS:
-        content = (
-            "# ixxy VPN LAB\n"
-            "# Серверы пока не добавлены\n"
-        )
-
-    else:
-        content = "\n".join(
-            VLESS_SERVERS
-        )
-
-    headers = {
-        "subscription-userinfo": subscription_header(
-            user
-        ),
-        "profile-title": "ixxy VPN LAB",
-        "profile-update-interval": "60",
-        "cache-control": "no-cache",
-    }
+    content = "\n".join(
+        VLESS_SERVERS
+    )
 
     return PlainTextResponse(
         content=content,
-        headers=headers,
-        media_type="text/plain; charset=utf-8",
+        headers={
+            "subscription-userinfo":
+                subscription_header(user),
+
+            "profile-title":
+                "ixxy VPN LAB",
+
+            "profile-update-interval":
+                "60",
+
+            "cache-control":
+                "no-cache",
+        },
     )
 
 
 # ============================================================
-# ADMIN / GLOBAL STATS
+# STATS
 # ============================================================
 
 @app.get("/api/stats")
 def api_stats():
+
     conn = db()
 
     users = conn.execute(
         "SELECT COUNT(*) FROM users"
-    ).fetchone()[0]
-
-    active_users = conn.execute(
-        """
-        SELECT COUNT(*)
-        FROM users
-        WHERE expire > ?
-        """,
-        (now(),),
-    ).fetchone()[0]
-
-    expired_users = conn.execute(
-        """
-        SELECT COUNT(*)
-        FROM users
-        WHERE expire <= ?
-        """,
-        (now(),),
     ).fetchone()[0]
 
     devices = conn.execute(
@@ -842,49 +968,15 @@ def api_stats():
         """
     ).fetchone()[0]
 
-    upload = conn.execute(
-        """
-        SELECT COALESCE(SUM(upload), 0)
-        FROM users
-        """
-    ).fetchone()[0]
-
-    download = conn.execute(
-        """
-        SELECT COALESCE(SUM(download), 0)
-        FROM users
-        """
-    ).fetchone()[0]
-
     conn.close()
-
-    total_traffic = int(upload) + int(download)
 
     return {
         "success": True,
-
-        "users": {
-            "total": users,
-            "active": active_users,
-            "expired": expired_users,
-        },
-
-        "devices": {
-            "active": devices,
-        },
-
-        "traffic": {
-            "upload": int(upload),
-            "download": int(download),
-            "total": total_traffic,
-            "upload_human": format_bytes(upload),
-            "download_human": format_bytes(download),
-            "total_human": format_bytes(total_traffic),
-        },
-
-        "servers": {
-            "total": len(VLESS_SERVERS),
-        },
+        "users": users,
+        "active_devices": devices,
+        "servers": len(
+            VLESS_SERVERS
+        ),
     }
 
 
@@ -896,14 +988,11 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(
-        os.getenv(
-            "PORT",
-            "8000",
-        )
+        os.getenv("PORT", "8000")
     )
 
     uvicorn.run(
-        app,
+        "server:app",
         host="0.0.0.0",
         port=port,
     )
